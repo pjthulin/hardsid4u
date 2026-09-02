@@ -50,7 +50,7 @@ import time
 
 import usb1
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
@@ -200,7 +200,19 @@ class HardSID4U:
 
     def open(self, set_config=True, hard_reset=False, start=True):
         self.ctx = usb1.USBContext()
-        self.ctx.open()
+        try:
+            self.ctx.open()
+        except (OSError, FileNotFoundError) as e:
+            raise RuntimeError(
+                "libusb-1.0 could not be loaded.\n"
+                "  macOS:  brew install libusb\n"
+                "  If Homebrew is in /usr/local (Intel Macs), the loader does\n"
+                "  not search there by default:\n"
+                '    export DYLD_LIBRARY_PATH="$(brew --prefix libusb)/lib:'
+                '$DYLD_LIBRARY_PATH"\n'
+                "  Linux:  install libusb-1.0-0 from your package manager\n"
+                f"  Original error: {e}"
+            ) from e
         self.h = self.ctx.openByVendorIDAndProductID(VID, PID, skip_on_error=True)
         if self.h is None:
             raise RuntimeError("HardSID 4U not found - powered on? switch to ON?")

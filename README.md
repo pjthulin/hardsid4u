@@ -153,7 +153,19 @@ document the path, not because they are good code.
 - Python 3.9+
 - `libusb1` (the `usb1` package) — note **not** PyUSB, which lacks the needed
   transfer support
-- libusb itself (`brew install libusb` on macOS)
+- libusb itself:
+
+```bash
+brew install libusb            # macOS
+sudo apt install libusb-1.0-0  # Debian/Ubuntu
+```
+
+On Intel Macs, Homebrew installs to `/usr/local`, which the Python loader does
+not search. If you get `cannot find a suitable libusb-1.0`:
+
+```bash
+export DYLD_LIBRARY_PATH="$(brew --prefix libusb)/lib:$DYLD_LIBRARY_PATH"
+```
 
 No kernel extension, no driver signing, no Zadig. The device is vendor-class
 so macOS does not claim it and libusb can talk to it directly.
