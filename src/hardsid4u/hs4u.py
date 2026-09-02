@@ -50,7 +50,7 @@ import time
 
 import usb1
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
@@ -292,37 +292,47 @@ class HardSID4U:
     def running(self):
         return bool(self.state()[2] & 0x80)
 
-    def start_engine(self, attempts=4):
+    def start_engine(self, attempts=6, settle=2.0):
         """Start the device from cold.
 
-        The real start command, taken from a cold-start capture of ACID64,
-        is a full 512-BYTE BLOCK whose first word is ff ff followed by
-        01 00, padded to 512 with ZERO bytes - not 0xFF filler, and not a
-        short packet.
+        The start command is a full 512-BYTE BLOCK: ff ff 01 00 padded to 512
+        with ZERO bytes. A successful start also resets the ring pointers.
 
-            ff ff 01 00 00 00 00 00 ... (508 zero bytes)
-
-        Our earlier hack (a 4-byte short packet plus filler blocks) sometimes
-        set state bit 7 but never armed the device, which is why every init
-        after a power cycle was silent while the same init sang once ACID64
-        had run.
+        Be patient between attempts. Each start block occupies 512 bytes of
+        ring space, so firing several in quick succession fills the ring and
+        leaves the device started but with no room - which then looks like a
+        wedged device on the next run.
         """
-        rd, wr, st, free = self.state()
-        if (st & 0x80) and free >= BLOCK * 2:
-            return          # running, and with room - nothing to do
-        if st & 0x80 and self.verbose:
-            print(f"  state says running but free={free}; sending start anyway")
         block = b"\xff\xff\x01\x00" + b"\x00" * (BLOCK - 4)
+
+        def ready():
+            rd, wr, st, free = self.state()
+            return (st & 0x80) and free >= BLOCK * 2, rd, wr, st, free
+
+        ok, rd, wr, st, free = ready()
+        if ok:
+            return
         for n in range(1, attempts + 1):
             self.h.bulkWrite(EP_OUT, block, timeout=TIMEOUT)
-            time.sleep(0.2)
-            rd, wr, st, free = self.state()
+            t0 = time.time()
+            while time.time() - t0 < settle:
+                ok, rd, wr, st, free = ready()
+                if ok:
+                    if self.verbose:
+                        print(f"  engine started on attempt {n}: "
+                              f"state={st:#06x} free={free}")
+                    return
+                time.sleep(0.05)
             if self.verbose:
-                print(f"  start block {n}: state={st:#06x} "
-                      f"rd={rd:#06x} wr={wr:#06x} free={free}")
-            if st & 0x80:
-                return
-        raise RuntimeError("could not start engine - power-cycle the unit")
+                print(f"  start attempt {n}: state={st:#06x} free={free} "
+                      f"rd={rd:#06x} wr={wr:#06x}")
+        raise RuntimeError(
+            f"could not start engine after {attempts} attempts "
+            f"(state={st:#06x}, free={free}, rd={rd:#06x}, wr={wr:#06x}).\n"
+            f"  hs4u.py v{VERSION}\n"
+            "  Power-cycle the HardSID (front switch off, wait a few seconds, "
+            "on) and try again."
+        )
 
     # -- command buffer ----------------------------------------------------
 

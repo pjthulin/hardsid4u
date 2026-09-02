@@ -7,7 +7,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "hardsid4u"))
-from hs4u import HardSID4U, PAL_CLOCK, TRIANGLE          # noqa: E402
+from hs4u import VERSION, HardSID4U, PAL_CLOCK, TRIANGLE          # noqa: E402
+
+print(f"hs4u v{VERSION}")
 
 with HardSID4U() as hs:
     hs.init()
