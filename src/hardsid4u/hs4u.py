@@ -50,7 +50,7 @@ import time
 
 import usb1
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
@@ -495,6 +495,38 @@ def freq_for_hz(hz, clock=PAL_CLOCK):
     return int(round(hz * 16777216 / clock)) & 0xFFFF
 
 
+def dump_status(repeat=3, interval=0.3):
+    """Read the raw 64-byte status block and show every interpretation.
+    Sends NOTHING to the device."""
+    import usb1 as _u
+    with _u.USBContext() as ctx:
+        h = ctx.openByVendorIDAndProductID(VID, PID, skip_on_error=True)
+        if h is None:
+            print("device not found")
+            return
+        try:
+            h.setConfiguration(1)
+        except _u.USBError:
+            pass
+        h.claimInterface(IFACE)
+        try:
+            for i in range(repeat):
+                raw = bytes(h.bulkRead(EP_IN, 64, timeout=1000))
+                rd, wr, st = struct.unpack_from("<HHH", raw, 0x1A)
+                used = (wr - rd) & (RING - 1)
+                print(f"read {i+1}:")
+                print(f"  raw[0:32] {raw[:32].hex(' ')}")
+                print(f"  +0x1A rd={rd:#06x} ({rd})")
+                print(f"  +0x1C wr={wr:#06x} ({wr})")
+                print(f"  +0x1E st={st:#06x}  running={bool(st & 0x80)}")
+                print(f"  used=(wr-rd)&0x1FFF = {used}   free=RING-used = "
+                      f"{RING - used}")
+                print(f"  reversed: (rd-wr)&0x1FFF = {(rd - wr) & (RING - 1)}")
+                time.sleep(interval)
+        finally:
+            h.releaseInterface(IFACE)
+
+
 def verify_init(path=None):
     """Prove the generated init is byte-identical to the reference capture.
 
@@ -548,12 +580,18 @@ def _demo():
                     help="issue a full USB device reset before configuring")
     ap.add_argument("--no-start", action="store_true",
                     help="skip our engine-start step (ACID64 never does it)")
+    ap.add_argument("--status", action="store_true",
+                    help="dump the raw status block and exit (sends nothing)")
     ap.add_argument("--verify", action="store_true",
                     help="check the generated init against the capture and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     print(f"hs4u.py v{VERSION}")
+
+    if args.status:
+        dump_status()
+        return
 
     if args.verify:
         verify_init()
