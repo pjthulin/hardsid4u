@@ -50,7 +50,7 @@ import time
 
 import usb1
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
@@ -307,8 +307,11 @@ class HardSID4U:
         after a power cycle was silent while the same init sang once ACID64
         had run.
         """
-        if self.running():
-            return
+        rd, wr, st, free = self.state()
+        if (st & 0x80) and free >= BLOCK * 2:
+            return          # running, and with room - nothing to do
+        if st & 0x80 and self.verbose:
+            print(f"  state says running but free={free}; sending start anyway")
         block = b"\xff\xff\x01\x00" + b"\x00" * (BLOCK - 4)
         for n in range(1, attempts + 1):
             self.h.bulkWrite(EP_OUT, block, timeout=TIMEOUT)
@@ -353,7 +356,23 @@ class HardSID4U:
             if self.state()[3] >= need:
                 return
             time.sleep(0.001)
-        raise RuntimeError("timed out waiting for ring space")
+        rd, wr, st, free = self.state()
+        msg = [
+            f"timed out waiting for {need} bytes of ring space "
+            f"(free={free}, rd={rd:#06x}, wr={wr:#06x}, state={st:#06x})",
+            "The device is not consuming data.",
+        ]
+        if st & 0x80:
+            msg += [
+                "state bit 7 is set, so start_engine() assumed the engine was",
+                "already running and did not restart it - but the ring is not",
+                "draining, so it is wedged from an earlier run.",
+            ]
+        else:
+            msg.append("state bit 7 is clear: the engine never started.")
+        msg.append("Power-cycle the HardSID (front switch off, wait, on) "
+                   "and run again.")
+        raise RuntimeError("\n  ".join(msg))
 
     def drain(self, limit=15.0):
         """Block until the device has played everything buffered.
