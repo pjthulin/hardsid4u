@@ -50,13 +50,13 @@ import time
 
 import usb1
 
-VERSION = "1.0.6"
+VERSION = "1.1.0"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
 EP_IN, EP_OUT = 0x81, 0x02
 BLOCK = 512
-RING = 0x2000
+RING = 0x2000          # device ring buffer size, 0x2000-0x3FFF
 TIMEOUT = 1000
 
 PAL_CLOCK = 985248
@@ -83,7 +83,9 @@ R_RESON_FILT = 0x17                    # resonance << 4 | filter routing bits
 R_MODE_VOL = 0x18                      # filter mode << 4 | volume
 
 # Control register bits (R_CONTROL)
-GATE, SYNC, RING, TEST = 0x01, 0x02, 0x04, 0x08
+# NB: RING_MOD, not RING - RING is the ring-BUFFER size above, and naming
+# this bit RING silently redefined it to 4 and broke all flow control.
+GATE, SYNC, RING_MOD, TEST = 0x01, 0x02, 0x04, 0x08
 TRIANGLE, SAWTOOTH, PULSE, NOISE = 0x10, 0x20, 0x40, 0x80
 
 # Filter mode bits (high nibble of R_MODE_VOL)
@@ -163,6 +165,12 @@ def chip_init_stream(chip):
     s += encode_delay(8) + encode_reg(chip, 0x19, 0x00)
     s += encode_delay(8) + encode_reg(chip, 0x1A, 0x00)
     return s
+
+
+assert RING == 0x2000, (
+    "RING has been redefined. It is the device ring-buffer size. Do not name "
+    "anything else RING - the SID ring-modulation bit is RING_MOD."
+)
 
 
 def _default_capture():
