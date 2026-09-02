@@ -43,13 +43,14 @@ Usage
         hs.reg(0, 0x04, 0x10)           # gate off
         hs.flush()
 """
+import os
 import struct
 import sys
 import time
 
 import usb1
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
@@ -162,6 +163,22 @@ def chip_init_stream(chip):
     s += encode_delay(8) + encode_reg(chip, 0x19, 0x00)
     s += encode_delay(8) + encode_reg(chip, 0x1A, 0x00)
     return s
+
+
+def _default_capture():
+    """Locate the reference capture whether run from the repo root, from
+    src/hardsid4u/, or with the package installed."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in ("hs4u_capture_writes.bin",
+                os.path.join("..", "..", "captures", "hs4u_capture_writes.bin"),
+                os.path.join("captures", "hs4u_capture_writes.bin")):
+        cand = os.path.normpath(os.path.join(here, rel))
+        if os.path.exists(cand):
+            return cand
+    cand = os.path.join(os.getcwd(), "captures", "hs4u_capture_writes.bin")
+    if os.path.exists(cand):
+        return cand
+    return "hs4u_capture_writes.bin"
 
 
 class HardSID4U:
@@ -411,14 +428,14 @@ class HardSID4U:
         self.flush()
         self.drain()
 
-    def init_from_capture(self, path="hs4u_capture_writes.bin",
-                          start=0, end=4096):
+    def init_from_capture(self, path=None, start=0, end=4096):
         """Replay a slice of the reference capture's init verbatim.
 
         The full 0:4096 slice is known to work. The clean generated init is
         byte-identical to the 2048:3758 slice, yet fails - so something in
         the 0:2048 prefix is doing the real arming. Use start/end to bisect.
         """
+        path = path or _default_capture()
         data = open(path, "rb").read()[start:end]
         self.raw(data)
         self.flush()
@@ -437,7 +454,7 @@ def freq_for_hz(hz, clock=PAL_CLOCK):
     return int(round(hz * 16777216 / clock)) & 0xFFFF
 
 
-def verify_init(path="hs4u_capture_writes.bin"):
+def verify_init(path=None):
     """Prove the generated init is byte-identical to the reference capture.
 
     If this fails, the copy of hs4u.py or of the capture on this machine is
@@ -445,13 +462,14 @@ def verify_init(path="hs4u_capture_writes.bin"):
     'generated' with '--captured-init' is meaningless.
     """
     import hashlib
+    path = path or _default_capture()
     gen = b"".join(chip_init_stream(c) for c in range(4))
     gen += encode_delay(40000) + encode_reg(0, 0x1E, 0x00)
     print(f"generated init : {len(gen)} bytes  sha256={hashlib.sha256(gen).hexdigest()[:16]}")
     try:
         cap = open(path, "rb").read()
     except OSError as e:
-        print(f"capture file   : MISSING ({e})")
+        print(f"capture file   : MISSING at {path}\n                 ({e})")
         return False
     print(f"capture file   : {len(cap)} bytes  sha256={hashlib.sha256(cap).hexdigest()[:16]}")
     for c in range(4):
