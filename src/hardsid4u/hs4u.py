@@ -50,7 +50,7 @@ import time
 
 import usb1
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
@@ -296,28 +296,26 @@ class HardSID4U:
         """Start the device from cold.
 
         The start command is a full 512-BYTE BLOCK: ff ff 01 00 padded to 512
-        with ZERO bytes. A successful start also resets the ring pointers.
+        with ZERO bytes (not 0xFF filler, not a short packet). A successful
+        start also resets the ring pointers.
 
-        Be patient between attempts. Each start block occupies 512 bytes of
-        ring space, so firing several in quick succession fills the ring and
-        leaves the device started but with no room - which then looks like a
-        wedged device on the next run.
+        CRITICAL: the start block is a TOGGLE. Sending it to a device that is
+        already running STOPS it - state goes 0x0081 -> 0x0001 and stays
+        there. So if bit 7 is set, send nothing at all, whatever the reported
+        free space says. A v1.0.3 "improvement" that also required free space
+        before returning early did exactly this and broke a working driver.
         """
-        block = b"\xff\xff\x01\x00" + b"\x00" * (BLOCK - 4)
-
-        def ready():
-            rd, wr, st, free = self.state()
-            return (st & 0x80) and free >= BLOCK * 2, rd, wr, st, free
-
-        ok, rd, wr, st, free = ready()
-        if ok:
+        if self.running():
             return
+
+        block = b"\xff\xff\x01\x00" + b"\x00" * (BLOCK - 4)
+        rd = wr = st = free = 0
         for n in range(1, attempts + 1):
             self.h.bulkWrite(EP_OUT, block, timeout=TIMEOUT)
             t0 = time.time()
             while time.time() - t0 < settle:
-                ok, rd, wr, st, free = ready()
-                if ok:
+                rd, wr, st, free = self.state()
+                if st & 0x80:
                     if self.verbose:
                         print(f"  engine started on attempt {n}: "
                               f"state={st:#06x} free={free}")
@@ -374,9 +372,9 @@ class HardSID4U:
         ]
         if st & 0x80:
             msg += [
-                "state bit 7 is set, so start_engine() assumed the engine was",
-                "already running and did not restart it - but the ring is not",
-                "draining, so it is wedged from an earlier run.",
+                "state bit 7 is set, so the engine reports itself running but",
+                "the ring is not draining. Do NOT send a start block to fix",
+                "this - it is a toggle and would stop the engine instead.",
             ]
         else:
             msg.append("state bit 7 is clear: the engine never started.")
