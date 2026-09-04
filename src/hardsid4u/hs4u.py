@@ -15,7 +15,11 @@ Word format Two bytes, DATA FIRST then COMMAND:
                 cmd 0x00-0x7F   (chip << 5) | reg    register write
                 cmd 0xEE        delay, low byte of cycle count
                 cmd 0xEF        delay, high byte     (emitted BEFORE 0xEE)
-                cmd 0xFF        filler, costs no time, pads to 512
+                cmd 0xFF        FILLER - and an ESCAPE PREFIX. It costs no
+                                time, but the device consumes the word AFTER
+                                it as an escape payload, so filler runs must
+                                have EVEN length. Use pad_even(), never pad
+                                by hand. See protocol.md 4b.
 
 Registers   0x00-0x18 are the SID's own registers.
             0x19-0x1F are HardSID DEVICE control registers, per socket.
@@ -24,7 +28,10 @@ Ring        8192 bytes of device address space, 0x2000-0x3FFF.
                 rd = status[0x1A], wr = status[0x1C]
                 used = (wr - rd) & 0x1FFF
                 free = 0x2000 - used
-            state = status[0x1E]; bit 7 set means the engine is running.
+            state = status[0x1E]: LOW NIBBLE = system mode, BIT 7 = the
+            device's acknowledgement of it. 0x0081 (mode 1 SIDPLAY, acked)
+            is the only healthy value. Bit 7 is not "engine running" -
+            that reading cost this project weeks. See protocol.md 4b.
 
 Init        Each socket must be armed before it will make a sound. The
             sequence writes ASCII 'S','I','D' to device registers 0x1D/0x1E/
@@ -50,7 +57,7 @@ import time
 
 import usb1
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 VID, PID = 0x6581, 0x8580
 IFACE = 0
@@ -86,6 +93,92 @@ R_MODE_VOL = 0x18                      # filter mode << 4 | volume
 # NB: RING_MOD, not RING - RING is the ring-BUFFER size above, and naming
 # this bit RING silently redefined it to 4 and broke all flow control.
 GATE, SYNC, RING_MOD, TEST = 0x01, 0x02, 0x04, 0x08
+
+# FILLER (0xFFFF) IS AN ESCAPE PREFIX, NOT INERT PADDING.
+#
+# docs/protocol.md section 4 documents this and we then ignored it for the
+# entire project. The device reads `ff ff` as an escape and consumes the
+# NEXT WORD as its payload:
+#
+#     ff ff        escape
+#     mm 00        (data mm, command 0x00) -> set system mode to mm
+#
+# status[0x1E] low nibble is the current mode, bit 7 is the acknowledge
+# flag. Verified live: sending `ff ff | 02 00` moved the device from
+# 0x0081 to 0x0002 and then 0x0082 - a mode change caused by two words,
+# with no register write anywhere.
+#
+# CONSEQUENCES, all confirmed:
+#   * The "engine start block" (`ff ff 01 00` + padding) is not an engine
+#     start at all. It is escape + "set mode 1 (SIDPLAY)".
+#   * state 0x0001 does not mean "engine stopped". It means mode 1 was
+#     requested and never acknowledged. Register writes are ignored in
+#     that state, which is why it looked like a dead device.
+#   * Re-sending mode 1 to a device already at mode 1 does nothing, which
+#     is exactly why start_engine() could never revive it and why every
+#     recovery attempt ended at the power switch. Recovery from a wedged
+#     state remains UNRELIABLE - see recover_mode(). Prevention is the
+#     fix; pad_even() is the fix.
+#   * A filler RUN of ODD length leaves an unpaired escape that swallows
+#     the following word. Padding must therefore always use an EVEN
+#     number of filler words - see pad_even().
+SYS_MODE_IDLE = 0      # not a playing mode; the reset rung
+SYS_MODE_SIDPLAY = 1
+SYS_MODE_VST = 2
+
+# Escape + set-mode-1. Kept under the old name because code and docs refer
+# to it; it is the byte pattern to never emit by accident.
+ENGINE_TOGGLE = b"\xff\xff\x01\x00"
+
+
+# What to pad blocks with. FILLER (0xFFFF) is the obvious choice and the
+# one the vendor uses - but it is an ESCAPE PREFIX, and a 512-byte block
+# carrying five register writes is 95% padding, so padding with it emits
+# ~122 escape+payload pairs per block. At 37 writes/second that is ~4500
+# escape commands per second.
+#
+# ACID64 packs 2048-byte transfers dense with real commands at 1-2 per
+# second and emits almost no filler at all - and never stalls, across
+# 1200+ writes in ten minutes. Our stall is one per ~180 writes. So the
+# hazard was never per-write; it scales with FILLER VOLUME, which is the
+# one axis on which we differ from ACID64 by three orders of magnitude.
+#
+# DELAY_ZERO (0xEE 0x00) is a zero-cycle delay: it costs no time, exactly
+# like filler, but it is an ordinary command rather than an escape.
+DELAY_ZERO = b"\x00\xee"
+
+# RESULT - this is the fix. Measured A/B, same traffic, same rate:
+#
+#     pad with FILLER      stalled at 82 and 94 writes
+#     pad with DELAY_ZERO  24,000 writes / 10 minutes / ZERO stalls
+#
+# The run with DELAY_ZERO ended because it reached its time limit, not
+# because anything went wrong. Better than a 250x improvement, and it
+# explains the ACID64 contrast that no other theory could: ACID64 packs
+# dense 2048-byte transfers and emits almost no filler, so it never
+# accumulated the escape traffic that kills us.
+PAD_WORD = DELAY_ZERO
+
+
+def pad_even(payload):
+    """Pad to a 512-byte boundary with an EVEN number of filler words.
+
+    Filler is an escape prefix, so an odd-length filler run ends with an
+    unpaired escape that consumes the first word of whatever follows it in
+    the ring - the next block's opening word. If that word is a register
+    write of the form (data, 0x00) the device reads it as a mode-set and
+    stops honouring register writes altogether.
+
+    Every block this driver built had an odd filler run, for every
+    possible payload length, because payloads were always an odd number of
+    words. One extra delay word fixes it for good.
+    """
+    if (len(payload) // 2) % 2:
+        payload += encode_delay(MIN_CYCLES)  # make the word count even
+    payload += PAD_WORD * (((-len(payload)) % BLOCK) // 2)
+    return payload
+
+
 TRIANGLE, SAWTOOTH, PULSE, NOISE = 0x10, 0x20, 0x40, 0x80
 
 # Filter mode bits (high nibble of R_MODE_VOL)
@@ -300,6 +393,86 @@ class HardSID4U:
     def running(self):
         return bool(self.state()[2] & 0x80)
 
+    def system_mode(self):
+        """(mode, acknowledged) from status[0x1E].
+
+        Low nibble is the current system mode (1 = SIDPLAY, 2 = VST), bit
+        7 is the device's acknowledgement. Register writes only behave as
+        documented in an ACKNOWLEDGED SIDPLAY mode - protocol.md section
+        4. `running()` is really "mode acknowledged"; the name predates
+        understanding the field.
+        """
+        st = self.state()[2]
+        return st & 0x0F, bool(st & 0x80)
+
+    def set_system_mode(self, mode, settle=1.0):
+        """Escape + set mode, then wait for the acknowledgement.
+
+        Two words: FILLER as the escape prefix, then (data=mode,
+        command=0x00). Padded to a full block with an EVEN filler run so
+        the block cannot itself arm another escape.
+        """
+        payload = pad_even(FILLER + word(0x00, mode))
+        self._wait_room(BLOCK * 2)
+        self.h.bulkWrite(EP_OUT, payload, timeout=TIMEOUT)
+        t0 = time.time()
+        while time.time() - t0 < settle:
+            m, ack = self.system_mode()
+            if m == mode and ack:
+                return True
+            time.sleep(0.02)
+        return self.system_mode() == (mode, True)
+
+    def recover_mode(self, target=SYS_MODE_SIDPLAY, attempts=4, settle=0.4,
+                      force=False):
+        """Bring a wedged device back to an acknowledged SIDPLAY mode.
+
+        HONEST STATUS: this works sometimes and is not to be relied on.
+        It recovered a device once (0x0001 -> 0x0082 -> 0x0081, in under a
+        second) and has failed on every attempt since - through mode 2,
+        through mode 0, with filler padding and with the vendor's zero
+        padding, and with a USB resetDevice() as well. A device that has
+        been sitting wedged appears to stop acknowledging mode changes
+        altogether, and then only the front-panel switch helps.
+
+        Why it is still here: the cost is a second, the failure mode is
+        "nothing happens", and when it does work it saves a power cycle.
+        But the real answer to this failure is not recovering from it - it
+        is pad_even(), which stops us causing it.
+
+        Does NOT re-arm the sockets; callers must follow with init() and
+        restore anything init() does not (notably 0x18, master volume).
+        """
+        for n in range(attempts):
+            mode, ack = self.system_mode()
+            # force=True skips this early-out on the first pass. It has to
+            # exist: the real failure leaves the device reporting mode 1
+            # ACKNOWLEDGED while its engine has stopped executing the
+            # stream entirely (measured: 200000 cycles of delay drained in
+            # 4ms against a 107ms healthy baseline). Trusting the mode
+            # field there made this function return True without sending
+            # anything, which is why the R key was a no-op in every single
+            # failure the user hit.
+            if mode == target and ack and not (force and n == 0):
+                return True
+            # Bounce through mode 0 (idle), NOT through the other playing
+            # mode. Measured: a device wedged at 0x0002 (mode 2 requested,
+            # never acknowledged) ignores a mode-1 request and stays
+            # unacknowledged forever; but from 0x0000 it acknowledges mode
+            # 1 within 400ms, first try. Mode 0 is the reset rung of this
+            # ladder - asking for a playing mode while already stuck on
+            # one is what never worked.
+            self.set_system_mode(SYS_MODE_IDLE, settle=1.0)
+            time.sleep(settle)
+            if self.set_system_mode(target, settle=1.5):
+                time.sleep(settle)
+                if self.system_mode() == (target, True):
+                    return True
+            if self.verbose:
+                print(f"  recover_mode attempt {n + 1}: "
+                      f"state now {self.state()[2]:#06x}")
+        return self.system_mode() == (target, True)
+
     def start_engine(self, attempts=6, settle=2.0):
         """Start the device from cold.
 
@@ -340,6 +513,67 @@ class HardSID4U:
             "on) and try again."
         )
 
+    def reset_engine(self, settle=3.0, attempts=8):
+        """Recover a wedged device.
+
+        Tries the MODE BOUNCE first, which is what actually works.
+        recover_mode() fixes the state this project spent its whole life
+        power-cycling out of - 0x0001, meaning a mode was requested and
+        never acknowledged, in which the device ignores every register
+        write. Measured: 0x0001 -> 0x0082 -> 0x0081 in well under a
+        second.
+
+        Only if that fails do we fall back to re-enumerating over USB,
+        which is slow, invalidates every handle, and has never actually
+        been observed to help. It is kept as a last resort, not as the
+        plan.
+
+        Does NOT re-arm the sockets: a de-armed socket discards every
+        register write until the 'S','I','D' knock is re-sent, so callers
+        must follow this with init(), and then restore anything init()
+        does not (notably 0x18, master volume).
+        """
+        # force=True: never trust the mode field here. See recover_mode().
+        if self.recover_mode(force=True):
+            return True
+        if self.verbose:
+            print("  mode bounce failed; falling back to USB resetDevice()")
+        try:
+            self.h.resetDevice()
+        except usb1.USBError as e:
+            if self.verbose:
+                print(f"  resetDevice: {e} (continuing)")
+        try:
+            self.close()
+        except Exception:
+            pass
+
+        # Give the device time to actually leave the bus before reopening.
+        time.sleep(settle)
+        last = None
+        deadline = time.time() + attempts
+        while time.time() < deadline:
+            try:
+                self.open(start=False)
+                break
+            except Exception as e:
+                last = e
+                time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"device did not come back after resetDevice(): {last}\n"
+                "  Power-cycle the HardSID (front switch off, wait, on).")
+
+        # Observed behaviour, worth knowing when reading logs: a device
+        # that was RUNNING comes back from resetDevice() still running
+        # (0x0081) - the reset is effectively a no-op for engine state,
+        # and start_engine() below correctly does nothing. A device that
+        # was STOPPED (0x0001) comes back cold (0x0000), and that is the
+        # case this function exists for: start_engine() then revives it,
+        # first try, where nothing else could.
+        self.start_engine()
+        return self.running()
+
     # -- command buffer ----------------------------------------------------
 
     def reg(self, chip, r, d):
@@ -357,10 +591,20 @@ class HardSID4U:
             return
         payload = self._buf
         self._buf = b""
-        payload += FILLER * (((-len(payload)) % BLOCK) // 2)
+        payload = pad_even(payload)
         for i in range(0, len(payload), BLOCK):
+            block = payload[i:i + BLOCK]
+            if block[:4] == ENGINE_TOGGLE:
+                # This exact 512-byte prefix is the engine start/stop
+                # toggle. Sent to a running engine it stops it, and a
+                # stopped engine needs the front-panel switch - see
+                # reset_engine(). Anything that builds one by accident is
+                # a bug worth failing loudly on.
+                raise RuntimeError(
+                    f"block at payload offset {i} begins with the engine "
+                    f"toggle {ENGINE_TOGGLE.hex(' ')}; refusing to send it")
             self._wait_room(BLOCK * 2)
-            self.h.bulkWrite(EP_OUT, payload[i:i + BLOCK], timeout=TIMEOUT)
+            self.h.bulkWrite(EP_OUT, block, timeout=TIMEOUT)
             if self.verbose:
                 rd, wr, st, free = self.state()
                 print(f"  block  rd={rd:#06x} wr={wr:#06x} "
@@ -498,7 +742,240 @@ class HardSID4U:
 
 
 def freq_for_hz(hz, clock=PAL_CLOCK):
-    return int(round(hz * 16777216 / clock)) & 0xFFFF
+    # Clamp, don't wrap: masking with 0xFFFF turned anything above ~C#7
+    # into a wildly wrong low pitch instead of the highest note the chip
+    # can make. Pitch bend at the top of the keyboard can cross that line.
+    return max(0, min(int(round(hz * 16777216 / clock)), 0xFFFF))
+
+
+def measure_delay_rate(hs, cycles=200000, limit=10.0, poll=0.01):
+    """How long does the device ACTUALLY take to execute a known delay?
+
+    Sends one block containing `cycles` of delta-delay and times how long
+    the ring takes to drain it. At the PAL clock, 200000 cycles should be
+    about 203ms. The ratio of measured to expected is the interesting
+    number:
+
+        ~0.5   MEASURED BASELINE on a healthy device (107ms for 200000
+               cycles). It reads low because rd rests one block behind wr,
+               so the drain test fires while the last block is still
+               nominally outstanding. Compare against this, not against
+               1.0.
+        >>1.0  the engine is executing the stream far too SLOWLY, which
+               would make every register write land late - a note-off
+               arriving seconds after it was sent is indistinguishable
+               from a hanging note, and a device that looks perfectly
+               healthy on every pointer and status check is exactly what
+               you would see
+        <<1.0  delays are being ignored altogether
+
+    Built because the forensic dumps show `rd` falling 2-5 blocks behind
+    `wr` during a failure and staying there, where healthy playing keeps
+    it at exactly 1 block in 336 of 340 writes. That is the signature of
+    an engine executing too slowly, and nothing else we measure would
+    catch it: the pointers still move, the mode is still acknowledged,
+    and every byte we send is still accepted.
+    """
+    expected = cycles / PAL_CLOCK
+    payload = pad_even(encode_delay(cycles))
+    hs._wait_room(BLOCK * 2)
+    rd0, wr0, st0, free0 = hs.state()
+    t0 = time.perf_counter()
+    hs.h.bulkWrite(EP_OUT, payload, timeout=TIMEOUT)
+    wr_target = hs.state()[1]
+    drained_at = None
+    while time.perf_counter() - t0 < limit:
+        rd, wr, st, free = hs.state()
+        remaining = (wr_target - rd) & (RING - 1)
+        if remaining <= BLOCK:
+            drained_at = time.perf_counter() - t0
+            break
+        time.sleep(poll)
+    return {
+        "cycles": cycles,
+        "expected_s": expected,
+        "measured_s": drained_at,
+        "ratio": (drained_at / expected) if drained_at else None,
+        "timed_out": drained_at is None,
+        "state": hs.state()[2],
+    }
+
+
+def full_drain_time(hs, cycles=100000, limit=4.0, settle=2.0):
+    """Time for the device to fully consume a block carrying `cycles` of
+    delta-delay - i.e. until `free` is back to maximum.
+
+    Calibrated across two decades on a healthy device and it tracks the
+    nominal delay almost exactly:
+
+        nominal    10ms   20ms   51ms  101ms  203ms  406ms  1000ms
+        measured    9ms   16ms   46ms   98ms  195ms  396ms   980ms
+
+    That is what makes it trustworthy where measure_delay_rate is not.
+    That one stops at "all but one block consumed", which lands at roughly
+    half the nominal delay and was flat across the first decade of the
+    sweep - it detects the failure, but it does not measure what its name
+    claims. This does.
+    """
+    payload = pad_even(encode_delay(cycles))
+    # Start from rest, or the measurement includes somebody else's backlog.
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < settle:
+        if hs.state()[3] >= RING - BLOCK:
+            break
+        time.sleep(0.005)
+    hs._wait_room(BLOCK * 2)
+    t0 = time.perf_counter()
+    hs.h.bulkWrite(EP_OUT, payload, timeout=TIMEOUT)
+    # Wait until the block is actually VISIBLE in the ring before timing
+    # the drain. The status read immediately after a bulkWrite can still
+    # report the pre-write `free`, in which case the drain test below is
+    # satisfied instantly and the function returns ~1ms for a perfectly
+    # healthy device. That race made the very first measurement after
+    # init() unreliable in both calibration runs, and it made the stall
+    # hunt announce "Device is ALREADY stalled" on a freshly power-cycled
+    # unit - costing two power cycles chasing a fault that was mine.
+    seen = False
+    while time.perf_counter() - t0 < 0.05:
+        if hs.state()[3] < RING - BLOCK:
+            seen = True
+            break
+        time.sleep(0.001)
+    if not seen:
+        # Either the device swallowed it faster than we could observe -
+        # which is the stall signature - or we lost the race again. The
+        # caller retries, so report it as "too fast to see" rather than
+        # guessing.
+        return 0.0
+    while time.perf_counter() - t0 < limit:
+        if hs.state()[3] >= RING - BLOCK:
+            return time.perf_counter() - t0
+        time.sleep(0.002)
+    return None
+
+
+def engine_executing(hs, cycles=100000, min_fraction=0.15):
+    """Is the engine actually EXECUTING the stream, or just swallowing it?
+
+    The only check that catches the real failure. Everything else reads
+    healthy while the device is dead: mode 1 acknowledged, ring pointers
+    advancing, `free` returning to rest, no USB error, every byte
+    accepted. The one thing that changes is that delta-delays stop taking
+    any time.
+
+    Uses full_drain_time(), which is calibrated 1:1 against the nominal
+    delay, and requires the device to have taken at least `min_fraction`
+    of the time it should have.
+
+    Measured ratios, which set the threshold:
+
+        healthy, device idle          0.97 - 1.05
+        healthy, mid-performance      0.36 - 0.52   (ring not at rest, so
+                                                     the drain test is
+                                                     satisfied earlier)
+        stalled                       0.00 - 0.05
+
+    min_fraction sits at 0.15, comfortably between the two populations.
+    It was 0.30, which is close enough to a legitimate 0.36 to risk crying
+    wolf at someone mid-performance - and a false alarm here costs a power
+    cycle, so the asymmetry is worth respecting.
+    """
+    nominal = cycles / PAL_CLOCK
+    # Measure up to three times and keep the LARGEST. A healthy device
+    # occasionally reads near-zero because of the status-read race above;
+    # a stalled one reads 1-5ms every single time. Taking the max makes a
+    # single unlucky sample harmless while leaving the real failure
+    # unmistakable - and a false "stalled" costs the user a power cycle,
+    # so the asymmetry matters.
+    best = 0.0
+    for _ in range(3):
+        m = full_drain_time(hs, cycles=cycles, limit=max(2.0, nominal * 8))
+        if m is None:
+            return True, {"cycles": cycles, "expected_s": nominal,
+                          "measured_s": None, "ratio": None}
+        best = max(best, m)
+        if best >= nominal * min_fraction:
+            break
+    r = {"cycles": cycles, "expected_s": nominal, "measured_s": best,
+         "ratio": (best / nominal) if best else 0.0}
+    return best >= nominal * min_fraction, r
+
+
+def delta_probe(hs, poll_interval=0.05, window=2.0, verbose=False):
+    """One-shot health check: is the engine honoring delta-timed delays,
+    or has 'running' (state bit 7) become a stale flag that no longer
+    reflects reality?
+
+    Sends one 512-byte block of maximum-length delay pairs (128 x 0xFFFF
+    cycles ~ 8.4M cycles ~ 8.5s at PAL clock) and tracks whether the ring's
+    read pointer reaches the exact end address of THIS block within a
+    short window, or stays genuinely behind it.
+
+    Anchors to wr_target (the ring address right after this block was
+    appended), not to a free-space comparison against an earlier
+    snapshot: this device's ring carries a persistent ~512-byte residual
+    even at rest (ordinary trailing FILLER padding from whatever was last
+    sent, which drains near-instantly but is still technically "in the
+    ring" at whatever moment a status read lands), so a naive free-space
+    comparison can be fooled by that unrelated content draining
+    coincidentally during the measurement window - this cost two rounds
+    of a false "engine is lying" conclusion before the anchoring above was
+    worked out. See docs/journey.md / project memory for the story.
+
+    Returns a dict with at least "honored" (bool). If not honored,
+    "recovered_after" is how long (seconds) the block actually took to
+    drain (should be ~8.5s if genuine). If honored, "remaining_at_end" is
+    how many bytes of the block were still unconsumed at the end of the
+    probe window.
+    """
+    rd0, wr0, st, free = hs.state()
+    block = encode_delay(0xFFFF) * 128
+    assert len(block) == BLOCK, len(block)
+    if verbose:
+        print(f"    block hex (first 16 bytes): {block[:16].hex(' ')}")
+        print(f"    before send: rd={rd0:#06x} wr={wr0:#06x}")
+    hs.h.bulkWrite(EP_OUT, block, timeout=TIMEOUT)
+    rd1, wr_target, st, free = hs.state()
+    if verbose:
+        print(f"    after send:  rd={rd1:#06x} wr={wr_target:#06x}  "
+              f"(my block ends at {wr_target:#06x})")
+
+    t0 = time.time()
+    while time.time() - t0 < window:
+        rd, wr, st, free = hs.state()
+        remaining = (wr_target - rd) & (RING - 1)
+        if verbose:
+            print(f"    t+{(time.time() - t0) * 1000:6.1f}ms  "
+                  f"rd={rd:#06x} remaining_of_my_block={remaining} "
+                  f"state={st:#06x}")
+        if remaining == 0:
+            return {
+                "honored": False,
+                "recovered_after": time.time() - t0,
+                "state": st,
+            }
+        time.sleep(poll_interval)
+    rd, wr, st, free = hs.state()
+    return {
+        "honored": True,
+        "recovered_after": None,
+        "state": st,
+        "remaining_at_end": (wr_target - rd) & (RING - 1),
+    }
+
+
+def report_probe(label, result):
+    if result["honored"]:
+        print(f"  [PROBE {label}] HONORED - my block still had "
+              f"{result['remaining_at_end']} bytes remaining at the end "
+              f"of the window (engine genuinely still working through "
+              f"the ~8.5s delay), state={result['state']:#06x}")
+    else:
+        print(f"  [PROBE {label}] *** NOT HONORED *** - this probe's "
+              f"block fully drained after only "
+              f"{result['recovered_after'] * 1000:.0f}ms "
+              f"(should take ~8.5s if genuinely executing). "
+              f"Engine status bit is LYING. state={result['state']:#06x}")
 
 
 def dump_status(repeat=3, interval=0.3):

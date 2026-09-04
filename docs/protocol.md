@@ -129,6 +129,59 @@ SIDPLAY mode before register writes behave as documented above.
 
 ---
 
+## 4b. 0xFFFF IS AN ESCAPE PREFIX — padding is not inert
+
+**[confirmed on hardware, 2026-09-04]** This is stated in §4 above and was then
+ignored for the entire life of this project, which cost weeks. It deserves its own
+section.
+
+`ff ff` is not only padding. The device reads it as an **escape prefix** and consumes
+the **next word** as the escape payload:
+
+```
+ff ff        escape
+mm 00        (data mm, command 0x00) -> set system mode to mm
+```
+
+Verified directly: sending just those two words moved a healthy device from
+`state=0x0081` to `0x0002` and then `0x0082`. No register write involved.
+
+### What state[0x1E] actually means
+
+`low nibble = mode, bit 7 = acknowledged`. So:
+
+| state | meaning |
+|---|---|
+| `0x0081` | mode 1 (SIDPLAY), acknowledged — **the only healthy state** |
+| `0x0082` | mode 2 (VST), acknowledged — register writes do NOT behave as documented |
+| `0x0001` | mode 1 requested, **never acknowledged** — device ignores every register write |
+| `0x0000` | idle / cold |
+
+Earlier notes in this file called bit 7 "the engine is running" and called the
+`ff ff 01 00` block "the start command". Both are wrong. There is no engine start:
+that block is *escape + set mode 1*, and "the engine stopped" was always a mode
+that never got acknowledged.
+
+### The padding rule that follows
+
+Because an escape consumes the following word, a **filler run of odd length** ends
+with an unpaired escape that swallows the first word of whatever comes next in the
+ring — i.e. the next block's opening word.
+
+**Always pad with an EVEN number of filler words.**
+
+Getting this wrong is not a subtle degradation. If the swallowed word happens to be
+a register write of the form `(data, 0x00)` — which is exactly what a voice-0
+frequency-low write looks like — the device silently changes system mode and stops
+honouring register writes. Symptoms: a note hangs forever with no way to gate it
+off, new notes are inaudible, and the status block reports perfect health the whole
+time because the *engine* is fine. Only a power cycle reliably clears it.
+
+This is what `hs4u.pad_even()` exists for. Every block this driver produced before
+that function had an odd filler run, for every possible payload length.
+
+---
+
 ## 5. Flushing / framing
 
 **[confirmed]** On flush the host computes:
@@ -159,7 +212,7 @@ these fields:
 | +0x18 | busy / activity flag |
 | +0x1A | ring **read** pointer |
 | +0x1C | ring **write** pointer |
-| +0x1E | device state; low nibble compared against a mode value, bit 7 set on success |
+| +0x1E | device state: **low nibble = current system mode, bit 7 = acknowledge** |
 
 Free-space calculation, verbatim from the code:
 
