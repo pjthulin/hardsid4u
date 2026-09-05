@@ -1,14 +1,24 @@
 [project]
 name = "hardsid4u"
-version = "1.0.0"
-description = "Talk to a HardSID 4U over libusb from macOS and Linux"
+version = "1.2.0"
+description = "Talk to a HardSID 4U over libusb from macOS and Linux, and play it live from a DAW"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 dependencies = ["libusb1>=3.0"]
 
+[project.optional-dependencies]
+# The MIDI instrument. The core driver stays libusb-only on purpose, so
+# anyone vendoring it for playback alone pulls in nothing extra.
+midi = ["python-rtmidi>=1.5.8"]
+# Only the acoustic verification tools in tools/ need these.
+audio = ["numpy>=1.24", "sounddevice>=0.4.6"]
+
+[project.scripts]
+hardsid4u-midi = "hardsid4u.midi:main"
+
 [project.urls]
-Homepage = "https://github.com/USERNAME/hardsid4u"
+Homepage = "https://github.com/pjthulin/hardsid4u"
 
 [build-system]
 requires = ["hatchling"]

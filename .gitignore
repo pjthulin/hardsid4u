@@ -7,3 +7,6 @@ hs4u/
 *.egg-info/
 dist/
 build/
+
+# forensic dumps written by midi.py
+hs4u-forensics-*.log
